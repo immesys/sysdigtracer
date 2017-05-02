@@ -11,15 +11,21 @@ import (
 	"github.com/opentracing/opentracing-go/log"
 )
 
-var poolBS sync.Pool = sync.Pool{
+// var poolBS sync.Pool = sync.Pool{
+// 	New: func() interface{} {
+// 		return make([]byte, 1024)
+// 	},
+// }
+
+var poolSpan sync.Pool = sync.Pool{
 	New: func() interface{} {
-		return make([]byte, 1024)
+		return &sysdigspan{}
 	},
 }
 
 type sysdigspan struct {
-	tags []byte
-	//	arguments map[string]string
+	tagsa    [128]byte
+	tags     []byte
 	id       uint64
 	tracer   *sysdigtracer
 	finished bool
@@ -54,7 +60,7 @@ var (
 func randomID() uint64 {
 	seededIDLock.Lock()
 	defer seededIDLock.Unlock()
-	return uint64(seededIDGen.Int63()) | 0x8000000000000000
+	return uint64(seededIDGen.Int63()) | 0x1000000000000000
 }
 
 type sysdigspancontext struct {
@@ -93,54 +99,77 @@ func (sd *sysdigtracer) StartSpan(
 	operationName string,
 	optz ...opentracing.StartSpanOption,
 ) opentracing.Span {
-	opts := opentracing.StartSpanOptions{}
+
+	rv := poolSpan.Get().(*sysdigspan)
+	rv.tracer = sd
+	rv.finished = false
+	rv.id = 0
+	if rv.tags == nil {
+		rv.tags = rv.tagsa[:0]
+	} else {
+		rv.tags = rv.tags[:0]
+	}
+
 	for _, o := range optz {
-		o.Apply(&opts)
-	}
-	rv := sysdigspan{
-		tracer: sd,
-		tags:   poolBS.Get().([]byte)[:0],
-	}
-
-ReferencesLoop:
-	for _, ref := range opts.References {
-		switch ref.Type {
-		case opentracing.ChildOfRef,
-			opentracing.FollowsFromRef:
-
-			refCtx := ref.ReferencedContext.(*sysdigspan)
+		rf, ok := o.(opentracing.SpanReference)
+		if ok {
+			refCtx := rf.ReferencedContext.(*sysdigspan)
 			rv.tags = append(rv.tags, refCtx.tags...)
 			rv.tags = append(rv.tags, '.')
 			rv.id = refCtx.id
-			break ReferencesLoop
+			break
 		}
 	}
+	/*
+		ReferencesLoop:
+			for _, ref := range opts.References {
+				switch ref.Type {
+				case opentracing.ChildOfRef,
+					opentracing.FollowsFromRef:
+
+					refCtx := ref.ReferencedContext.(*sysdigspan)
+					rv.tags = append(rv.tags, refCtx.tags...)
+					rv.tags = append(rv.tags, '.')
+					rv.id = refCtx.id
+					break ReferencesLoop
+				}
+			}*/
 	if rv.id == 0 {
 		rv.id = randomID()
+		//	fmt.Printf("random id was %d\n", rv.id)
 	}
 	for i := 0; i < len(operationName); i++ {
 		rv.tags = append(rv.tags, byte(operationName[i]))
 	}
 	//rv.tags = append(rv.tags, []byte(operationName)...)
-	trbuf := poolBS.Get().([]byte)
-	trbuf = trbuf[:23+len(rv.tags)+2]
+	//trbuf := poolBS.Get().([]byte)
+	alen := 22 + len(rv.tags) + 2
+	var trbuf []byte
+	if alen < 256 {
+		trbufa := [256]byte{}
+		trbuf = trbufa[:alen]
+	} else {
+		trbuf = make([]byte, alen)
+	}
+
+	//	trbuf := make([]byte, 23+len(rv.tags)+2)
 	trbuf[0] = '>'
 	trbuf[1] = ':'
 	id := rv.id
-	for i := 21; i >= 2; i-- {
+	for i := 20; i >= 2; i-- {
 		trbuf[i] = '0' + byte(id%10)
 		id /= 10
 	}
-	trbuf[22] = ':'
-	copy(trbuf[23:], rv.tags)
+	trbuf[21] = ':'
+	copy(trbuf[22:], rv.tags)
+	trbuf[22+len(rv.tags)] = ':'
 	trbuf[23+len(rv.tags)] = ':'
-	trbuf[24+len(rv.tags)] = ':'
 	//	tr := fmt.Sprintf(">:%d:%s::\n", rv.id, rv.tags)
 	//fmt.Print(tr)
-	//	fmt.Println(string(trbuf))
+	//fmt.Println(string(trbuf))
 	sd.f.Write(trbuf)
-	poolBS.Put(trbuf)
-	return &rv
+	//poolBS.Put(trbuf)
+	return rv
 }
 
 // noopSpan:
@@ -159,25 +188,26 @@ func (n *sysdigspan) Finish() {
 		return
 	}
 	n.finished = true
-
-	trbuf := poolBS.Get().([]byte)
-	trbuf = trbuf[:23+len(n.tags)+2]
+	trbufa := [128]byte{}
+	trbuf := trbufa[:22+len(n.tags)+2]
+	id := n.id
+	//	trbuf = trbuf[:23+len(n.tags)+2]
 	trbuf[0] = '<'
 	trbuf[1] = ':'
-	id := n.id
-	for i := 21; i >= 2; i-- {
+	for i := 20; i >= 2; i-- {
 		trbuf[i] = '0' + byte(id%10)
 		id /= 10
 	}
-	trbuf[22] = ':'
-	copy(trbuf[23:], n.tags)
+	trbuf[21] = ':'
+	copy(trbuf[22:], n.tags)
+	trbuf[22+len(n.tags)] = ':'
 	trbuf[23+len(n.tags)] = ':'
-	trbuf[24+len(n.tags)] = ':'
 	//	tr := fmt.Sprintf(">:%d:%s::\n", rv.id, rv.tags)
 	//fmt.Print(tr)
 	//	fmt.Println(string(trbuf))
 	n.tracer.f.Write(trbuf)
-	poolBS.Put(trbuf)
+	//	fmt.Println(string(trbuf))
+	//	poolBS.Put(trbuf)
 
 	// bs := poolBS.Get().([]byte)[:0]
 	// b := bytes.NewBuffer(bs)
@@ -199,8 +229,8 @@ func (n *sysdigspan) Finish() {
 	// 	panic(err)
 	// }
 	// poolBS.Put(bs)
-	poolBS.Put(n.tags)
-	n.tags = nil
+	//poolBS.Put(n.tags)
+	poolSpan.Put(n)
 }
 func (n *sysdigspan) FinishWithOptions(opts opentracing.FinishOptions) {
 	n.Finish()
